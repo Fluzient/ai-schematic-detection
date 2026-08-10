@@ -1,0 +1,21 @@
+# Dependencies and local package cache
+node_modules/
+.npm-cache/
+
+# Generated extension output
+dist/
+build/dist/
+*.eext
+
+# Local environment and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+

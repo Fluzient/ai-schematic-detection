@@ -1,0 +1,46 @@
+{
+	"name": "ai-schematic-detection",
+	"uuid": "58c7ba322da640b6a71e2f6b8940e150",
+	"displayName": "原理图AI检测",
+	"description": "以文字形式获取原理图信息，让 AI 真正理解你的电路设计",
+	"version": "0.1.0",
+	"publisher": "local",
+	"engines": {
+		"eda": "^3.0.0"
+	},
+	"license": "Apache-2.0",
+	"categories": "Other",
+	"keywords": [
+		"AI",
+		"原理图",
+		"检查",
+		"检测",
+		"对话"
+	],
+	"images": {
+		"logo": "./images/logo.png"
+	},
+	"activationEvents": {},
+	"entry": "./dist/index",
+	"dependentExtensions": {},
+	"headerMenus": {
+		"sch": [
+			{
+				"id": "AI Inspection",
+				"title": "AI检测",
+				"menuItems": [
+					{
+						"id": "SchematicInspection",
+						"title": "原理图AI检测...",
+						"registerFn": "schematicAiInspection"
+					},
+					{
+						"id": "InspectionConfig",
+						"title": "设置...",
+						"registerFn": "schematicAiInspectionConfig"
+					}
+				]
+			}
+		]
+	}
+}

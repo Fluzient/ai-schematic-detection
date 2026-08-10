@@ -1,0 +1,2117 @@
+/**
+ * AI原理图审查 - 数据采集模块
+ *
+ * 从EDA API采集器件、引脚、导线、网络标记等数据
+ */
+import type {
+	CollectedData,
+	CollectionMeta,
+	RawArc,
+	RawBus,
+	RawCircle,
+	RawComponent,
+	RawDrcResult,
+	RawNet,
+	RawNetLabel,
+	RawPin,
+	RawPolygon,
+	RawPrimitivePin,
+	RawProjectInfo,
+	RawRectangle,
+	RawText,
+} from '../domain/types';
+import { ErrorCode, ReviewError } from '../domain/types';
+
+/**
+ * 日志发送函数（通过 MessageBus 发送到前端）
+ */
+let logToIFrame: ((level: string, message: string, data?: any) => void) | null = null;
+
+/**
+ * 调试日志开关（默认关闭）
+ */
+const ENABLE_VERBOSE_DEBUG_LOGS = false;
+
+export function setLogToIFrame(fn: (level: string, message: string, data?: any) => void): void {
+	logToIFrame = fn;
+}
+
+function log(level: string, message: string, data?: any): void {
+	// debug 级别日志需要开关控制
+	if (level === 'debug' && !ENABLE_VERBOSE_DEBUG_LOGS) {
+		return;
+	}
+
+	// 发送到前端调试面板
+	if (logToIFrame) {
+		logToIFrame(level, message, data);
+	}
+
+	// 只有 warn/error 才输出到控制台
+	if (level === 'warn') {
+		console.warn(`[${level.toUpperCase()}] ${message}`, data || '');
+	}
+	else if (level === 'error') {
+		console.error(`[${level.toUpperCase()}] ${message}`, data || '');
+	}
+}
+
+/**
+ * 文本/总线采集选项
+ */
+interface CollectTextAndBusOptions {
+	/** 当前采集页 UUID（逐页采集时填充） */
+	schematicPageUuid?: string;
+}
+
+/**
+ * 并发控制：限制同时执行的Promise数量
+ */
+async function promiseAllWithLimit<T>(
+	tasks: Array<() => Promise<T>>,
+	limit: number,
+): Promise<T[]> {
+	// 参数守卫
+	if (limit < 1) {
+		throw new Error('promiseAllWithLimit: limit must be >= 1');
+	}
+	if (tasks.length === 0) {
+		return [];
+	}
+
+	const results: T[] = Array.from({ length: tasks.length });
+	let index = 0;
+
+	async function worker(): Promise<void> {
+		while (index < tasks.length) {
+			const currentIndex = index++;
+			results[currentIndex] = await tasks[currentIndex]();
+		}
+	}
+
+	const workers = Array.from(
+		{ length: Math.min(limit, tasks.length) },
+		() => worker(),
+	);
+	await Promise.all(workers);
+	return results;
+}
+
+/**
+ * 采集原理图数据（完全逐页采集策略）
+ *
+ * 性能优化要点：
+ * 1. 所有元素（Component/Wire/Text/Bus/Pin/NetLabel）均逐页采集（避免跨页 ID 失效）
+ * 2. 每页内先采集 Wire+NetLabel，再采集 Component+Pin（Pin 需要 Wire+NetLabel 数据做网络绑定）
+ * 3. 减少每个图元的属性获取次数
+ */
+export async function collectSchematicData(): Promise<CollectedData> {
+	const startTime = Date.now();
+	log('info', '[采集] 开始采集原理图数据...');
+
+	// 检查是否有打开的原理图文档
+	const docInfo = await eda.dmt_SelectControl.getCurrentDocumentInfo();
+	if (!docInfo || docInfo.documentType !== 1) { // EDMT_EditorDocumentType.SCHEMATIC_PAGE = 1
+		log('warn', '[采集] 当前文档不是原理图，终止采集', {
+			documentType: docInfo?.documentType,
+		});
+		throw new ReviewError(
+			ErrorCode.COLLECT_NO_DOCUMENT,
+			'没有打开的原理图文档',
+		);
+	}
+
+	const originalTabId = docInfo.tabId;
+	const meta: CollectionMeta = {
+		mode: 'per-page-hybrid',
+		quality: 'full',
+		expectedPageCount: 0,
+		collectedPageCount: 0,
+		collectedPageUuids: [],
+		missingPageUuids: [],
+	};
+
+	try {
+		// 获取当前原理图下的全部图页信息
+		const pages = await eda.dmt_Schematic.getCurrentSchematicAllSchematicPagesInfo();
+		meta.expectedPageCount = pages.length;
+		log('info', `[采集] 检测到 ${pages.length} 个图页`);
+
+		// 先采集全局数据（无需逐页，与页面切换无关）
+		const t0 = Date.now();
+		const [netlistRaw, drcResult, projectInfo] = await Promise.all([
+			collectNetlist(),
+			collectDrcResult(),
+			collectProjectInfo(),
+		]);
+		log('info', `[采集] 全局数据采集完成 (耗时 ${Date.now() - t0}ms)`, {
+			hasNetlist: !!netlistRaw,
+			drcPassed: drcResult?.passed,
+			projectName: projectInfo?.projectName,
+		});
+
+		// 解析网表构建 pin-net 映射（全局）
+		const netlistMap = parseNetlist(netlistRaw);
+
+		// 逐页采集所有元素（Component/Wire/Text/Bus/Pin/NetLabel）
+		let components: RawComponent[] = [];
+		let pins: RawPin[] = [];
+		let allValidWires: Array<{ net: string; lines: number[][] }> = [];
+		let allEmptyWires: Array<{ lines: number[][] }> = [];
+		let texts: RawText[] = [];
+		let buses: RawBus[] = [];
+		let netLabels: RawNetLabel[] = [];
+		let arcs: RawArc[] = [];
+		let circles: RawCircle[] = [];
+		let polygons: RawPolygon[] = [];
+		let rectangles: RawRectangle[] = [];
+		let primitivePins: RawPrimitivePin[] = [];
+
+		if (pages.length === 1) {
+			// 单页场景：无需切换
+			const t1 = Date.now();
+			const [wireData, pageTexts, pageBuses, pageNetLabels, pageArcs, pageCircles, pagePolygons, pageRectangles, pagePrimitivePins] = await Promise.all([
+				collectWires(),
+				collectTexts({ schematicPageUuid: pages[0].uuid }),
+				collectBuses({ schematicPageUuid: pages[0].uuid }),
+				collectNetLabels({ schematicPageUuid: pages[0].uuid }),
+				collectArcs({ schematicPageUuid: pages[0].uuid }),
+				collectCircles({ schematicPageUuid: pages[0].uuid }),
+				collectPolygons({ schematicPageUuid: pages[0].uuid }),
+				collectRectangles({ schematicPageUuid: pages[0].uuid }),
+				collectPrimitivePins({ schematicPageUuid: pages[0].uuid }),
+			]);
+
+			allValidWires = wireData.validWires;
+			allEmptyWires = wireData.emptyWires;
+
+			// 采集器件+引脚（需要 Wire+NetLabel 数据）
+			const { components: pageComponents, pins: pagePins } = await collectComponentsAndPins({
+				schematicPageUuid: pages[0].uuid,
+				netlistMap,
+				wireData,
+				netLabels: pageNetLabels,
+			});
+
+			components = pageComponents;
+			pins = pagePins;
+			texts = pageTexts;
+			buses = pageBuses;
+			netLabels = pageNetLabels;
+			arcs = pageArcs;
+			circles = pageCircles;
+			polygons = pagePolygons;
+			rectangles = pageRectangles;
+			primitivePins = pagePrimitivePins;
+
+			log('info', `[采集] 单页数据采集完成: ${components.length} 器件, ${pins.length} 引脚, ${allValidWires.length + allEmptyWires.length} 导线, ${texts.length} 文本, ${buses.length} 总线, ${netLabels.length} 网络标记, ${arcs.length} 圆弧, ${circles.length} 圆, ${polygons.length} 多边形, ${rectangles.length} 矩形, ${primitivePins.length} 独立引脚 (耗时 ${Date.now() - t1}ms)`);
+			meta.collectedPageUuids = [pages[0].uuid];
+			meta.collectedPageCount = 1;
+		}
+		else {
+			// 多页场景：逐页切换采集
+			log('info', `[采集] 开始逐页采集所有元素...`);
+			const t1 = Date.now();
+			for (let i = 0; i < pages.length; i++) {
+				const page = pages[i];
+				const pageStartTime = Date.now();
+				try {
+					// 打开并激活页面
+					const pageTabId = await eda.dmt_EditorControl.openDocument(page.uuid);
+					if (!pageTabId) {
+						log('warn', `[采集] 无法打开图页 ${i + 1}/${pages.length}: ${page.name}`);
+						meta.missingPageUuids.push(page.uuid);
+						continue;
+					}
+
+					await eda.dmt_EditorControl.activateDocument(pageTabId);
+
+					// 先采集 Wire/Text/Bus/NetLabel/图形图元
+					const [wireData, pageTexts, pageBuses, pageNetLabels, pageArcs, pageCircles, pagePolygons, pageRectangles, pagePrimitivePins] = await Promise.all([
+						collectWires(),
+						collectTexts({ schematicPageUuid: page.uuid }),
+						collectBuses({ schematicPageUuid: page.uuid }),
+						collectNetLabels({ schematicPageUuid: page.uuid }),
+						collectArcs({ schematicPageUuid: page.uuid }),
+						collectCircles({ schematicPageUuid: page.uuid }),
+						collectPolygons({ schematicPageUuid: page.uuid }),
+						collectRectangles({ schematicPageUuid: page.uuid }),
+						collectPrimitivePins({ schematicPageUuid: page.uuid }),
+					]);
+
+					allValidWires.push(...wireData.validWires);
+					allEmptyWires.push(...wireData.emptyWires);
+
+					// 再采集器件+引脚（需要 Wire+NetLabel 数据做网络绑定）
+					const { components: pageComponents, pins: pagePins } = await collectComponentsAndPins({
+						schematicPageUuid: page.uuid,
+						netlistMap,
+						wireData,
+						netLabels: pageNetLabels,
+					});
+
+					components.push(...pageComponents);
+					pins.push(...pagePins);
+					texts.push(...pageTexts);
+					buses.push(...pageBuses);
+					netLabels.push(...pageNetLabels);
+					arcs.push(...pageArcs);
+					circles.push(...pageCircles);
+					polygons.push(...pagePolygons);
+					rectangles.push(...pageRectangles);
+					primitivePins.push(...pagePrimitivePins);
+					meta.collectedPageUuids.push(page.uuid);
+					log('info', `[采集] 图页 ${i + 1}/${pages.length} (${page.name}): ${pageComponents.length} 器件, ${pagePins.length} 引脚, ${wireData.validWires.length + wireData.emptyWires.length} 导线, ${pageTexts.length} 文本, ${pageBuses.length} 总线, ${pageNetLabels.length} 网络标记, ${pageArcs.length} 圆弧, ${pageCircles.length} 圆, ${pagePolygons.length} 多边形, ${pageRectangles.length} 矩形, ${pagePrimitivePins.length} 独立引脚 (耗时 ${Date.now() - pageStartTime}ms)`);
+				}
+				catch (pageError) {
+					log('error', `[采集] 采集图页失败 ${i + 1}/${pages.length} (${page.name})`, pageError);
+					meta.missingPageUuids.push(page.uuid);
+				}
+			}
+			log('info', `[采集] 逐页采集完成: 总计 ${components.length} 器件, ${pins.length} 引脚, ${allValidWires.length + allEmptyWires.length} 导线, ${texts.length} 文本, ${buses.length} 总线, ${netLabels.length} 网络标记, ${arcs.length} 圆弧, ${circles.length} 圆, ${polygons.length} 多边形, ${rectangles.length} 矩形, ${primitivePins.length} 独立引脚 (总耗时 ${Date.now() - t1}ms)`);
+
+			meta.collectedPageCount = meta.collectedPageUuids.length;
+			if (meta.missingPageUuids.length > 0) {
+				meta.quality = 'partial';
+			}
+		}
+
+		// 检查数据完整性
+		if (components.length === 0 && allValidWires.length === 0) {
+			meta.quality = 'stale';
+		}
+
+		// 恢复用户原始焦点页
+		try {
+			await eda.dmt_EditorControl.activateDocument(originalTabId);
+		}
+		catch (restoreError) {
+			log('warn', '[采集] 恢复原始文档焦点失败', {
+				error: restoreError instanceof Error ? restoreError.message : String(restoreError),
+			});
+		}
+
+		// 统计网络
+		const nets = buildNetStatistics(pins);
+
+		// 统计元件属性获取情况
+		const stats = {
+			total: components.length,
+			withValue: components.filter(c => c.value).length,
+			withPrefix: components.filter(c => c.prefix).length,
+			withAddIntoPcb: components.filter(c => c.addIntoPcb).length,
+			withLcscPart: components.filter(c => c.lcscPart).length,
+			withJlcPart: components.filter(c => c.jlcPart).length,
+			withBomInclude: components.filter(c => c.bomInclude).length,
+			withManufacturer: components.filter(c => c.manufacturer).length,
+			withManufacturerPartNumber: components.filter(c => c.manufacturerPartNumber).length,
+		};
+
+		log('info', `[采集] 元件属性统计`, stats);
+
+		const totalTime = Date.now() - startTime;
+		log('success', `[采集] 采集完成: ${components.length} 器件, ${pins.length} 引脚, ${nets.length} 网络, ${netLabels.length} 网络标记 (总耗时 ${totalTime}ms)`);
+
+		return {
+			components,
+			pins,
+			nets,
+			texts,
+			buses,
+			netLabels,
+			arcs,
+			circles,
+			polygons,
+			rectangles,
+			primitivePins,
+			drcResult,
+			projectInfo,
+			netlistRaw,
+			timestamp: Date.now(),
+			meta,
+		};
+	}
+	catch (error) {
+		// 确保恢复原始焦点页
+		try {
+			await eda.dmt_EditorControl.activateDocument(originalTabId);
+		}
+		catch {
+			// ignore
+		}
+
+		log('error', '[采集] 采集失败', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		throw new ReviewError(
+			ErrorCode.COLLECT_API_FAILED,
+			`数据采集失败: ${error instanceof Error ? error.message : String(error)}`,
+			error,
+		);
+	}
+}
+
+/**
+ * 采集当前页的器件及其引脚（统一采集，避免跨页 ID 失效）
+ *
+ * 在同一个页面上下文中完成：
+ * 1. 获取器件列表 → 分离 netflag/netport 和普通器件
+ * 2. 获取普通器件的详细信息和引脚
+ * 3. 绑定网络（L1:网表 → L2:导线坐标 → L3:网络标记坐标 → L4:导线拓扑）
+ */
+async function collectComponentsAndPins(options: {
+	schematicPageUuid?: string;
+	netlistMap: Map<string, string>;
+	wireData: WireData;
+	netLabels: RawNetLabel[];
+}): Promise<{ components: RawComponent[]; pins: RawPin[] }> {
+	const { schematicPageUuid, netlistMap, wireData, netLabels } = options;
+
+	// 调试：函数入口日志（必定触发）
+	log('info', `[采集] ========== 开始采集器件和引脚 ==========`, {
+		时间戳: new Date().toISOString(),
+		页面UUID: schematicPageUuid || '(单页模式)',
+		网表映射数: netlistMap.size,
+		有效导线数: wireData.validWires.length,
+		空导线数: wireData.emptyWires.length,
+		网络标记数: netLabels.length,
+	});
+
+	// 构建导线拓扑图（L4 策略）
+	const wireClusters = buildWireTopology(wireData.validWires, wireData.emptyWires, netLabels);
+
+	// 获取当前页的所有器件（allSchematicPages=false）
+	const primitives = await eda.sch_PrimitiveComponent.getAll(undefined, false);
+
+	// 第一阶段：仅获取 componentType 进行分类
+	const filterTasks = primitives.map(primitive => async () => ({
+		primitive,
+		componentType: await primitive.getState_ComponentType(),
+	}));
+	const filtered = await promiseAllWithLimit(filterTasks, 100);
+
+	// 过滤掉网络标记类器件（NET_FLAG/NET_PORT）— 它们已在 collectNetLabels() 中单独采集
+	const validPrimitives = filtered.filter(
+		item => item.componentType !== 'netflag' && item.componentType !== 'netport',
+	);
+
+	// 调试：输出器件采集统计
+	log('info', `[采集] 器件采集统计`, {
+		总器件数: primitives.length,
+		过滤后: filtered.length,
+		有效器件数: validPrimitives.length,
+		网络标记数: filtered.length - validPrimitives.length,
+	});
+
+	// 第二阶段：获取器件详细信息 + 引脚
+	const allComponents: RawComponent[] = [];
+	const allPins: RawPin[] = [];
+
+	// 未绑定引脚统计（汇总输出，避免逐条日志风暴）
+	const MAX_UNRESOLVED_SAMPLES = 12;
+	let unresolvedPinCount = 0;
+	let unresolvedPowerPinCount = 0;
+	const unresolvedPinSamples: any[] = [];
+
+	const componentTasks = validPrimitives.map(({ primitive }, _index) => async () => {
+		// 第一阶段：获取关键字段（失败则跳过整个元件）
+		let primitiveId = '';
+		let designator = '';
+		let pinPrimitives: any[] = [];
+
+		try {
+			// 先获取 primitiveId（只调用一次，避免重复）
+			primitiveId = await primitive.getState_PrimitiveId();
+
+			// 并行获取关键字段：designator 和 pins
+			[designator, pinPrimitives] = await Promise.all([
+				primitive.getState_Designator(),
+				eda.sch_PrimitiveComponent.getAllPinsByPrimitiveId(primitiveId),
+			]);
+		}
+		catch (criticalError) {
+			log('error', `[采集] 获取关键信息失败（跳过元件）`, {
+				primitiveId: primitiveId || '(unknown)',
+				error: criticalError instanceof Error ? criticalError.message : String(criticalError),
+			});
+			// 关键信息获取失败，跳过这个元件
+			return { component: null, pins: [] };
+		}
+
+		// 第二阶段：获取非关键字段（失败则使用默认值）
+		let name = '';
+		let x = 0;
+		let y = 0;
+		let rotation = 0;
+
+		try {
+			[name, x, y, rotation] = await Promise.all([
+				primitive.getState_Name(),
+				primitive.getState_X(),
+				primitive.getState_Y(),
+				primitive.getState_Rotation(),
+			]);
+		}
+		catch (nonCriticalError) {
+			log('warn', `[采集] 获取非关键信息失败（使用默认值）`, {
+				designator,
+				primitiveId,
+				error: nonCriticalError instanceof Error ? nonCriticalError.message : String(nonCriticalError),
+			});
+			// 非关键字段失败，使用默认值继续
+		}
+
+		// 制造商信息和关键属性（从 OtherProperty 和标准方法获取）
+		let manufacturer = '';
+		let manufacturerPartNumber = '';
+		let value = '';
+		let prefix = '';
+		let addIntoPcb = '';
+		let lcscPart = '';
+		let jlcPart = '';
+		let bomInclude = '';
+
+		try {
+			// 获取标准属性（这些方法确实存在）
+			const [mfr, mpn, aipBool, aibBool] = await Promise.all([
+				primitive.getState_Manufacturer(),
+				primitive.getState_ManufacturerId(),
+				primitive.getState_AddIntoPcb(),
+				primitive.getState_AddIntoBom(),
+			]);
+			manufacturer = mfr || '';
+			manufacturerPartNumber = mpn || '';
+			addIntoPcb = aipBool !== undefined ? String(aipBool) : '';
+			bomInclude = aibBool !== undefined ? String(aibBool) : '';
+
+			// LCSC 料号提取：优先使用 primitive.supplierId（直接属性）
+			// supplierId 是 primitive 的直接属性，与 otherProperty 无关，所以先读取
+			const supplierIdDirect = (primitive as any).supplierId;
+			if (supplierIdDirect && /^C\d+$/i.test(String(supplierIdDirect).trim())) {
+				lcscPart = String(supplierIdDirect).trim();
+			}
+
+			// 获取 OtherProperty（包含 Value、Prefix、LCSC Part、JLC Part 等）
+			const otherProperty = await primitive.getState_OtherProperty();
+			if (otherProperty) {
+				// 尝试多种可能的键名
+				value = String(otherProperty.Value || otherProperty.value || '');
+				prefix = String(otherProperty.Prefix || otherProperty.prefix || '');
+
+				// 如果 supplierId 没有获取到 LCSC 编号，回退到 OtherProperty 中查找
+				if (!lcscPart) {
+					const lcscPartName = String(otherProperty['LCSC Part Name'] || '');
+					const lcscPartDirect = String(otherProperty['LCSC Part'] || otherProperty.LcscPart || otherProperty.lcscPart || '');
+
+					// 优先使用直接的 LCSC Part 编号
+					if (lcscPartDirect && /^C\d+$/i.test(lcscPartDirect.trim())) {
+						lcscPart = lcscPartDirect.trim();
+					}
+					// 检查 LCSC Part Name 是否是编号格式（如 "C12345"）
+					else if (lcscPartName && /^C\d+$/i.test(lcscPartName.trim())) {
+						lcscPart = lcscPartName.trim();
+					}
+					// 遍历所有键，查找任何包含 LCSC 编号的值
+					else {
+						for (const key of Object.keys(otherProperty)) {
+							const val = String(otherProperty[key] || '').trim();
+							if (/^C\d{4,}$/.test(val) && key.toLowerCase().includes('lcsc')) {
+								lcscPart = val;
+								break;
+							}
+						}
+						// 如果仍未找到 LCSC 编号，使用 LCSC Part Name 作为名称标识
+						if (!lcscPart && lcscPartName) {
+							lcscPart = lcscPartName;
+						}
+					}
+				}
+
+				jlcPart = String(
+					otherProperty['JLCPCB Part Class']
+					|| otherProperty['JLC Part']
+					|| otherProperty.JlcPart
+					|| otherProperty.jlcPart
+					|| '',
+				);
+
+				// BomInclude 可能在 OtherProperty 中，也可能在标准属性中
+				if (!bomInclude) {
+					bomInclude = String(otherProperty['BOM Include'] || otherProperty.BomInclude || otherProperty.bomInclude || '');
+				}
+			}
+
+			// 如果 Prefix 仍为空，尝试从 designator 中提取（如 "R1" → "R"）
+			if (!prefix && designator) {
+				const match = designator.match(/^([A-Z]+)/i);
+				if (match) {
+					prefix = match[1];
+				}
+			}
+		}
+		catch (error) {
+			// 某些器件可能没有这些属性
+			log('warn', `[采集] 获取元件属性失败 (${designator})`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+
+		const component: RawComponent = {
+			primitiveId,
+			designator: designator || '',
+			name: name || '',
+			value,
+			prefix,
+			addIntoPcb,
+			lcscPart,
+			jlcPart,
+			bomInclude,
+			manufacturer,
+			manufacturerPartNumber,
+			x,
+			y,
+			rotation: rotation || 0,
+			schematicPageUuid,
+		};
+
+		// 采集该器件的引脚（逐个容错，避免单个引脚失败导致整个元件被跳过）
+		const componentPins: RawPin[] = [];
+		let pinFailureCount = 0;
+		if (pinPrimitives && pinPrimitives.length > 0) {
+			const pinTasks = pinPrimitives.map((pinPrimitive, pinIndex) => async () => {
+				try {
+					const [
+						pinPrimitiveId,
+						pinNumber,
+						pinName,
+						electricalType,
+						pinX,
+						pinY,
+					] = await Promise.all([
+						pinPrimitive.getState_PrimitiveId(),
+						pinPrimitive.getState_PinNumber(),
+						pinPrimitive.getState_PinName(),
+						pinPrimitive.getState_pinType(),
+						pinPrimitive.getState_X(),
+						pinPrimitive.getState_Y(),
+					]);
+
+					const pinKey = `${component.designator}_${pinNumber}`;
+
+					// L1: 只使用网表映射（保守模式）
+					// 禁用 L2/L3/L4 策略以避免假阳性（将 NC 引脚错误绑定到附近的导线）
+					const netName: string | null = netlistMap.get(pinKey) || null;
+					const confidence = netName ? 1.0 : 0;
+					const reason = netName ? 'netlist' : 'unresolved';
+					const debugInfo: any = {
+						pin: pinKey,
+						coord: `(${pinX}, ${pinY})`,
+						L1_netlist: netName || 'miss',
+					};
+
+					// 保守模式不使用坐标邻近性推断，避免把 NC 引脚绑定到附近导线。
+
+					// 输出未绑定引脚的调试信息（附带最近邻距离以诊断容差问题）
+					if (!netName) {
+						const nearestWire = findNearestWireDistance(pinX, pinY, wireData.validWires, wireData.emptyWires);
+						const nearestLabel = findNearestLabelDistance(pinX, pinY, netLabels);
+						const nearestTopo = findNearestTopoDistance(pinX, pinY, wireClusters);
+						debugInfo.nearest = {
+							wire: nearestWire ? `${nearestWire.distance.toFixed(1)}(${nearestWire.net || 'empty'})` : 'none',
+							label: nearestLabel ? `${nearestLabel.distance.toFixed(1)}(${nearestLabel.net})` : 'none',
+							topo: nearestTopo ? `${nearestTopo.distance.toFixed(1)}` : 'none',
+						};
+
+						// 汇总统计，不再逐条输出
+						if (electricalType === 'Power' || electricalType === 'Ground') {
+							unresolvedPowerPinCount++;
+						}
+						else {
+							unresolvedPinCount++;
+						}
+
+						// 收集前 N 条样本
+						if (unresolvedPinSamples.length < MAX_UNRESOLVED_SAMPLES) {
+							unresolvedPinSamples.push(debugInfo);
+						}
+					}
+
+					return {
+						primitiveId: pinPrimitiveId,
+						componentPrimitiveId: component.primitiveId,
+						componentDesignator: component.designator,
+						pinNumber: pinNumber || '',
+						pinName: pinName || '',
+						pinType: electricalType || 'Passive',
+						netName,
+						netBindingConfidence: confidence,
+						netBindingReason: reason,
+					} as RawPin;
+				}
+				catch (pinError) {
+					pinFailureCount++;
+					log('warn', `[采集] 引脚获取失败（跳过该引脚）`, {
+						designator: component.designator,
+						primitiveId: component.primitiveId,
+						pinIndex,
+						error: pinError instanceof Error ? pinError.message : String(pinError),
+					});
+					return null; // 返回 null 表示该引脚失败
+				}
+			});
+
+			const pinResults = await promiseAllWithLimit(pinTasks, 50);
+			// 过滤掉失败的引脚（null）
+			componentPins.push(...pinResults.filter((pin): pin is RawPin => pin !== null));
+
+			// 如果引脚失败率过高，记录警告
+			if (pinFailureCount > 0) {
+				log('warn', `[采集] 元件引脚部分失败`, {
+					designator: component.designator,
+					primitiveId: component.primitiveId,
+					totalPins: pinPrimitives.length,
+					failedPins: pinFailureCount,
+					successPins: componentPins.length,
+				});
+			}
+		}
+
+		return { component, pins: componentPins };
+	});
+
+	const results = await promiseAllWithLimit(componentTasks, 30);
+	for (const result of results) {
+		if (result.component === null)
+			continue; // 基本信息获取失败的元件跳过
+		allComponents.push(result.component);
+		allPins.push(...result.pins);
+	}
+
+	// 汇总输出未绑定引脚统计
+	if (unresolvedPinCount > 0 || unresolvedPowerPinCount > 0) {
+		log(unresolvedPowerPinCount > 0 ? 'warn' : 'info', '[Pin-Net] 未绑定引脚汇总', {
+			unresolvedPinCount,
+			unresolvedPowerPinCount,
+			sampleCount: unresolvedPinSamples.length,
+			samples: unresolvedPinSamples,
+		});
+	}
+
+	return { components: allComponents, pins: allPins };
+}
+
+/**
+ * 后台网表获取状态（用于延迟回填）
+ */
+interface BackgroundNetlistState {
+	promise: Promise<string | undefined>;
+	startTime: number;
+	completed: boolean;
+	result?: string;
+	duration?: number;
+	token: number; // 版本控制：只有 token 匹配的回调才能更新状态
+}
+
+let backgroundNetlistState: BackgroundNetlistState | null = null;
+let backgroundNetlistTokenCounter = 0; // 全局 token 计数器
+
+/**
+ * 采集网表（带超时保护 + 后台继续获取）
+ *
+ * 策略：
+ * 1. 启动网表获取，设置 10 秒超时
+ * 2. 如果超时，返回 undefined 让主流程继续（使用 L2/L3/L4）
+ * 3. 但网表获取在后台继续运行，记录实际耗时
+ * 4. 如果最终成功，通过 orchestrator 触发重新绑定
+ */
+async function collectNetlist(): Promise<string | undefined> {
+	try {
+		const NETLIST_TIMEOUT_MS = 10000; // 10秒超时（主流程）
+		const startTime = Date.now();
+		log('info', `[采集] 开始获取网表...`);
+
+		// 使用 PROTEL2 格式（实际返回 PROTEL NETLIST 2.0 格式）
+		const netlistPromise = eda.sch_Netlist.getNetlist(ESYS_NetlistType.PROTEL2);
+
+		// 分配新的 token，防止旧任务的回调覆盖新任务
+		const currentToken = ++backgroundNetlistTokenCounter;
+
+		// 保存到全局状态，供后续查询
+		backgroundNetlistState = {
+			promise: netlistPromise.then(
+				(result) => {
+					const duration = Date.now() - startTime;
+					// 只有 token 匹配才更新状态（防止旧任务覆盖新任务）
+					if (backgroundNetlistState && backgroundNetlistState.token === currentToken) {
+						backgroundNetlistState.completed = true;
+						backgroundNetlistState.result = result;
+						backgroundNetlistState.duration = duration;
+						log('success', `[采集] 网表后台获取成功 (token=${currentToken}, 耗时 ${duration}ms, 大小: ${result.length} 字符)`);
+					}
+					else {
+						log('warn', `[采集] 网表后台获取成功但已过期 (token=${currentToken}, 当前=${backgroundNetlistState?.token})`);
+					}
+					return result;
+				},
+				(error) => {
+					const duration = Date.now() - startTime;
+					// 只有 token 匹配才更新状态
+					if (backgroundNetlistState && backgroundNetlistState.token === currentToken) {
+						backgroundNetlistState.completed = true;
+						backgroundNetlistState.duration = duration;
+						log('error', `[采集] 网表后台获取失败 (token=${currentToken}, 耗时 ${duration}ms): ${error instanceof Error ? error.message : String(error)}`);
+					}
+					else {
+						log('warn', `[采集] 网表后台获取失败但已过期 (token=${currentToken}, 当前=${backgroundNetlistState?.token})`);
+					}
+					return undefined;
+				},
+			),
+			startTime,
+			completed: false,
+			token: currentToken,
+		};
+
+		// 主流程等待超时
+		const result = await Promise.race([
+			netlistPromise,
+			new Promise<undefined>((resolve) => {
+				setTimeout(() => resolve(undefined), NETLIST_TIMEOUT_MS);
+			}),
+		]);
+
+		if (result === undefined) {
+			log('warn', `[采集] 网表获取超时 (${NETLIST_TIMEOUT_MS}ms)，跳过网表绑定（后台继续获取中...）`);
+		}
+		else {
+			log('info', `[采集] 网表格式: Protel2, 大小: ${result.length} 字符 (耗时 ${Date.now() - startTime}ms)`);
+		}
+
+		return result;
+	}
+	catch (error) {
+		log('error', `[采集] 网表获取异常: ${error instanceof Error ? error.message : String(error)}`);
+		return undefined;
+	}
+}
+
+/**
+ * 获取后台网表状态（供外部查询）
+ */
+export function getBackgroundNetlistState(): BackgroundNetlistState | null {
+	return backgroundNetlistState;
+}
+
+/**
+ * 清除后台网表状态
+ */
+export function clearBackgroundNetlistState(): void {
+	backgroundNetlistState = null;
+}
+
+/**
+ * 导线数据结构（包含有 net 和无 net 的导线）
+ */
+interface WireData {
+	validWires: Array<{ net: string; lines: number[][] }>;
+	emptyWires: Array<{ lines: number[][] }>;
+}
+
+/**
+ * 采集导线（包括 net 为空的导线，用于拓扑分析）
+ */
+async function collectWires(): Promise<WireData> {
+	const wirePrimitives = await eda.sch_PrimitiveWire.getAll();
+
+	let emptyNetCount = 0;
+
+	const wireTasks = wirePrimitives.map(wire => async () => {
+		const [net, line] = await Promise.all([
+			wire.getState_Net(),
+			wire.getState_Line(),
+		]);
+
+		if (!line) {
+			return null;
+		}
+
+		// 规范化line为二维数组
+		const lines = Array.isArray(line[0]) ? line as number[][] : [line as number[]];
+
+		if (!net) {
+			emptyNetCount++;
+			return { type: 'empty' as const, lines };
+		}
+
+		return { type: 'valid' as const, net, lines };
+	});
+
+	const results = await promiseAllWithLimit(wireTasks, 50);
+	const validWires: Array<{ net: string; lines: number[][] }> = [];
+	const emptyWires: Array<{ lines: number[][] }> = [];
+
+	for (const result of results) {
+		if (!result)
+			continue;
+		if (result.type === 'valid') {
+			validWires.push({ net: result.net, lines: result.lines });
+		}
+		else {
+			emptyWires.push({ lines: result.lines });
+		}
+	}
+
+	// 输出导线采集统计
+	log('info', `[采集] 导线统计: 总数=${wirePrimitives.length}, 有效=${validWires.length}, net为空=${emptyNetCount}`);
+
+	return { validWires, emptyWires };
+}
+
+/**
+ * 采集文本标注
+ * 失败时降级为空数组，不阻塞主流程
+ */
+async function collectTexts(
+	options: CollectTextAndBusOptions = {},
+): Promise<RawText[]> {
+	const { schematicPageUuid } = options;
+
+	try {
+		let failedCount = 0;
+		const textPrimitives = await eda.sch_PrimitiveText.getAll();
+
+		const textTasks = textPrimitives.map(textPrimitive => async () => {
+			try {
+				const [primitiveId, content, x, y] = await Promise.all([
+					textPrimitive.getState_PrimitiveId(),
+					textPrimitive.getState_Content(),
+					textPrimitive.getState_X(),
+					textPrimitive.getState_Y(),
+				]);
+
+				return {
+					primitiveId,
+					content: content || '',
+					x,
+					y,
+					schematicPageUuid,
+				} as RawText;
+			}
+			catch {
+				failedCount++;
+				return null;
+			}
+		});
+
+		const results = await promiseAllWithLimit(textTasks, 50);
+		const filtered = results.filter((item): item is RawText => item !== null);
+
+		if (failedCount > 0) {
+			log('warn', '[采集] 文本图元采集部分失败', {
+				failedCount,
+				total: textPrimitives.length,
+				schematicPageUuid: schematicPageUuid || '(当前页)',
+			});
+		}
+
+		return filtered;
+	}
+	catch (error) {
+		log('warn', '[采集] 采集文本标注失败，已降级为空数组', {
+			error: error instanceof Error ? error.message : String(error),
+			schematicPageUuid: schematicPageUuid || '(当前页)',
+		});
+		return [];
+	}
+}
+
+/**
+ * 采集总线
+ * 失败时降级为空数组，不阻塞主流程
+ */
+async function collectBuses(
+	options: CollectTextAndBusOptions = {},
+): Promise<RawBus[]> {
+	const { schematicPageUuid } = options;
+
+	try {
+		let failedCount = 0;
+		const busPrimitives = await eda.sch_PrimitiveBus.getAll();
+
+		const busTasks = busPrimitives.map(busPrimitive => async () => {
+			try {
+				const [primitiveId, busName, line] = await Promise.all([
+					busPrimitive.getState_PrimitiveId(),
+					busPrimitive.getState_BusName(),
+					busPrimitive.getState_Line(),
+				]);
+
+				if (!line) {
+					return null;
+				}
+
+				// 规范化 line 为二维数组
+				const lines = Array.isArray(line[0])
+					? line as number[][]
+					: [line as number[]];
+
+				return {
+					primitiveId,
+					busName: busName || '',
+					lines,
+					schematicPageUuid,
+				} as RawBus;
+			}
+			catch {
+				failedCount++;
+				return null;
+			}
+		});
+
+		const results = await promiseAllWithLimit(busTasks, 50);
+		const filtered = results.filter((item): item is RawBus => item !== null);
+
+		if (failedCount > 0) {
+			log('warn', '[采集] 总线图元采集部分失败', {
+				failedCount,
+				total: busPrimitives.length,
+				schematicPageUuid: schematicPageUuid || '(当前页)',
+			});
+		}
+
+		return filtered;
+	}
+	catch (error) {
+		log('warn', '[采集] 采集总线失败，已降级为空数组', {
+			error: error instanceof Error ? error.message : String(error),
+			schematicPageUuid: schematicPageUuid || '(当前页)',
+		});
+		return [];
+	}
+}
+
+/**
+ * 采集网络标记（GND、VCC 等标签）
+ * 失败时降级为空数组，不阻塞主流程
+ */
+async function collectNetLabels(
+	options: CollectTextAndBusOptions = {},
+): Promise<RawNetLabel[]> {
+	const { schematicPageUuid } = options;
+
+	try {
+		let failedCount = 0;
+		// 获取当前页的所有器件
+		const primitives = await eda.sch_PrimitiveComponent.getAll(undefined, false);
+
+		// 第一阶段：仅获取 componentType 进行过滤
+		const filterTasks = primitives.map(primitive => async () => ({
+			primitive,
+			componentType: await primitive.getState_ComponentType(),
+		}));
+		const filtered = await promiseAllWithLimit(filterTasks, 100);
+
+		// 只保留网络标记类器件（NET_FLAG/NET_PORT）
+		const netLabelPrimitives = filtered.filter(
+			item => item.componentType === 'netflag' || item.componentType === 'netport',
+		);
+
+		// 第二阶段：获取网络标记的详细信息
+		const netLabelTasks = netLabelPrimitives.map(({ primitive, componentType }) => async () => {
+			try {
+				const [primitiveId, designator, x, y] = await Promise.all([
+					primitive.getState_PrimitiveId(),
+					primitive.getState_Designator(),
+					primitive.getState_X(),
+					primitive.getState_Y(),
+				]);
+
+				// 网络标记的 designator 就是网络名称（如 "GND", "VCC_3V3"）
+				return {
+					primitiveId,
+					netName: designator || '',
+					x,
+					y,
+					type: componentType as 'netflag' | 'netport',
+					schematicPageUuid,
+				} as RawNetLabel;
+			}
+			catch {
+				failedCount++;
+				return null;
+			}
+		});
+
+		const results = await promiseAllWithLimit(netLabelTasks, 50);
+		const filteredResults = results.filter((item): item is RawNetLabel => item !== null);
+
+		if (failedCount > 0) {
+			log('warn', '[采集] 网络标记采集部分失败', {
+				failedCount,
+				total: netLabelPrimitives.length,
+				schematicPageUuid: schematicPageUuid || '(当前页)',
+			});
+		}
+
+		return filteredResults;
+	}
+	catch (error) {
+		log('warn', '[采集] 采集网络标记失败，已降级为空数组', {
+			error: error instanceof Error ? error.message : String(error),
+			schematicPageUuid: schematicPageUuid || '(当前页)',
+		});
+		return [];
+	}
+}
+
+/**
+ * 采集 DRC 检查结果（全局，不依赖页面切换）
+ * 失败时降级为 undefined，不阻塞主流程
+ */
+async function collectDrcResult(): Promise<RawDrcResult | undefined> {
+	const t0 = Date.now();
+	log('info', '[采集] 开始采集 DRC 检查结果...');
+
+	try {
+		const passed = await eda.sch_Drc.check(false, false);
+		const result: RawDrcResult = {
+			passed: !!passed,
+			strict: false,
+			timestamp: Date.now(),
+		};
+		log('info', `[采集] DRC 检查完成 (耗时 ${Date.now() - t0}ms)`, {
+			passed: result.passed,
+		});
+		return result;
+	}
+	catch (error) {
+		log('warn', '[采集] DRC 检查失败，已降级为 undefined', {
+			error: error instanceof Error ? error.message : String(error),
+			elapsed: Date.now() - t0,
+		});
+		return undefined;
+	}
+}
+
+/**
+ * 采集当前工程元信息（全局，不依赖页面切换）
+ * 失败时降级为 undefined，不阻塞主流程
+ */
+async function collectProjectInfo(): Promise<RawProjectInfo | undefined> {
+	const t0 = Date.now();
+	log('info', '[采集] 开始采集工程元信息...');
+
+	try {
+		const project = await eda.dmt_Project.getCurrentProjectInfo();
+		if (!project) {
+			log('warn', '[采集] 工程元信息为空，已降级为 undefined', {
+				elapsed: Date.now() - t0,
+			});
+			return undefined;
+		}
+		const result: RawProjectInfo = {
+			projectName: project.friendlyName || project.name || '',
+			projectDescription: project.description || undefined,
+			projectUuid: project.uuid,
+			timestamp: Date.now(),
+		};
+		log('info', `[采集] 工程元信息采集完成 (耗时 ${Date.now() - t0}ms)`, {
+			projectName: result.projectName,
+			projectUuid: result.projectUuid,
+		});
+		return result;
+	}
+	catch (error) {
+		log('warn', '[采集] 工程元信息获取失败，已降级为 undefined', {
+			error: error instanceof Error ? error.message : String(error),
+			elapsed: Date.now() - t0,
+		});
+		return undefined;
+	}
+}
+
+/**
+ * 采集圆弧图元
+ * 失败时降级为空数组，不阻塞主流程
+ */
+async function collectArcs(
+	options: CollectTextAndBusOptions = {},
+): Promise<RawArc[]> {
+	const { schematicPageUuid } = options;
+	const t0 = Date.now();
+
+	try {
+		let failedCount = 0;
+		let deriveFailedCount = 0;
+		const arcPrimitives = await eda.sch_PrimitiveArc.getAll();
+
+		const arcTasks = arcPrimitives.map(arcPrimitive => async () => {
+			try {
+				const [primitiveId, startX, startY, referenceX, referenceY, endX, endY] = await Promise.all([
+					arcPrimitive.getState_PrimitiveId(),
+					arcPrimitive.getState_StartX(),
+					arcPrimitive.getState_StartY(),
+					arcPrimitive.getState_ReferenceX(),
+					arcPrimitive.getState_ReferenceY(),
+					arcPrimitive.getState_EndX(),
+					arcPrimitive.getState_EndY(),
+				]);
+
+				// 三点求外接圆计算圆弧几何参数
+				const geometry = deriveArcGeometry(startX, startY, referenceX, referenceY, endX, endY);
+				if (!geometry) {
+					failedCount++;
+					deriveFailedCount++;
+					return null;
+				}
+
+				return {
+					primitiveId,
+					...geometry,
+					schematicPageUuid,
+				} as RawArc;
+			}
+			catch {
+				failedCount++;
+				return null;
+			}
+		});
+
+		const results = await promiseAllWithLimit(arcTasks, 50);
+		const filtered = results.filter((item): item is RawArc => item !== null);
+
+		if (failedCount > 0) {
+			log('warn', '[采集] 圆弧图元采集部分失败', {
+				failedCount,
+				deriveFailedCount,
+				total: arcPrimitives.length,
+				schematicPageUuid: schematicPageUuid || '(当前页)',
+			});
+		}
+
+		log('info', `[采集] 圆弧图元采集完成: 总数=${arcPrimitives.length}, 成功=${filtered.length}, 失败=${failedCount} (几何推导失败=${deriveFailedCount}), 耗时=${Date.now() - t0}ms`);
+
+		return filtered;
+	}
+	catch (error) {
+		log('warn', '[采集] 采集圆弧图元失败，已降级为空数组', {
+			error: error instanceof Error ? error.message : String(error),
+			elapsed: Date.now() - t0,
+			schematicPageUuid: schematicPageUuid || '(当前页)',
+		});
+		return [];
+	}
+}
+
+/**
+ * 采集圆图元
+ * 失败时降级为空数组，不阻塞主流程
+ */
+async function collectCircles(
+	options: CollectTextAndBusOptions = {},
+): Promise<RawCircle[]> {
+	const { schematicPageUuid } = options;
+	const t0 = Date.now();
+
+	try {
+		let failedCount = 0;
+		const circlePrimitives = await eda.sch_PrimitiveCircle.getAll();
+
+		const circleTasks = circlePrimitives.map(circlePrimitive => async () => {
+			try {
+				const [primitiveId, cx, cy, radius] = await Promise.all([
+					circlePrimitive.getState_PrimitiveId(),
+					circlePrimitive.getState_CenterX(),
+					circlePrimitive.getState_CenterY(),
+					circlePrimitive.getState_Radius(),
+				]);
+
+				return {
+					primitiveId,
+					cx,
+					cy,
+					radius,
+					schematicPageUuid,
+				} as RawCircle;
+			}
+			catch {
+				failedCount++;
+				return null;
+			}
+		});
+
+		const results = await promiseAllWithLimit(circleTasks, 50);
+		const filtered = results.filter((item): item is RawCircle => item !== null);
+
+		if (failedCount > 0) {
+			log('warn', '[采集] 圆图元采集部分失败', {
+				failedCount,
+				total: circlePrimitives.length,
+				schematicPageUuid: schematicPageUuid || '(当前页)',
+			});
+		}
+
+		log('info', `[采集] 圆图元采集完成: 总数=${circlePrimitives.length}, 成功=${filtered.length}, 失败=${failedCount}, 耗时=${Date.now() - t0}ms`);
+
+		return filtered;
+	}
+	catch (error) {
+		log('warn', '[采集] 采集圆图元失败，已降级为空数组', {
+			error: error instanceof Error ? error.message : String(error),
+			elapsed: Date.now() - t0,
+			schematicPageUuid: schematicPageUuid || '(当前页)',
+		});
+		return [];
+	}
+}
+
+/**
+ * 采集多边形/折线图元
+ * 失败时降级为空数组，不阻塞主流程
+ */
+async function collectPolygons(
+	options: CollectTextAndBusOptions = {},
+): Promise<RawPolygon[]> {
+	const { schematicPageUuid } = options;
+	const t0 = Date.now();
+
+	try {
+		let failedCount = 0;
+		let invalidLineCount = 0;
+		let tooFewPointsCount = 0;
+		const polygonPrimitives = await eda.sch_PrimitivePolygon.getAll();
+
+		const polygonTasks = polygonPrimitives.map(polygonPrimitive => async () => {
+			try {
+				const [primitiveId, line] = await Promise.all([
+					polygonPrimitive.getState_PrimitiveId(),
+					polygonPrimitive.getState_Line(),
+				]);
+
+				if (!line) {
+					invalidLineCount++;
+					return null;
+				}
+
+				// 将平坦的坐标数组转为点对数组
+				const points: number[][] = [];
+				const flatLine = Array.isArray(line[0]) ? (line as number[][]).flat() : line as number[];
+				for (let i = 0; i + 1 < flatLine.length; i += 2) {
+					points.push([flatLine[i], flatLine[i + 1]]);
+				}
+
+				if (points.length < 2) {
+					tooFewPointsCount++;
+					return null;
+				}
+
+				// 判断是否闭合（首尾点重合）
+				const first = points[0];
+				const last = points[points.length - 1];
+				const closed = points.length > 2 && first[0] === last[0] && first[1] === last[1];
+
+				return {
+					primitiveId,
+					points,
+					closed,
+					schematicPageUuid,
+				} as RawPolygon;
+			}
+			catch {
+				failedCount++;
+				return null;
+			}
+		});
+
+		const results = await promiseAllWithLimit(polygonTasks, 50);
+		const filtered = results.filter((item): item is RawPolygon => item !== null);
+
+		if (failedCount > 0) {
+			log('warn', '[采集] 多边形图元采集部分失败', {
+				failedCount,
+				total: polygonPrimitives.length,
+				schematicPageUuid: schematicPageUuid || '(当前页)',
+			});
+		}
+
+		if (invalidLineCount > 0 || tooFewPointsCount > 0) {
+			log('warn', '[采集] 多边形图元存在无效几何数据', {
+				invalidLineCount,
+				tooFewPointsCount,
+				total: polygonPrimitives.length,
+				schematicPageUuid: schematicPageUuid || '(当前页)',
+			});
+		}
+
+		log('info', `[采集] 多边形图元采集完成: 总数=${polygonPrimitives.length}, 成功=${filtered.length}, 失败=${failedCount}, 无效line=${invalidLineCount}, 点数不足=${tooFewPointsCount}, 耗时=${Date.now() - t0}ms`);
+
+		return filtered;
+	}
+	catch (error) {
+		log('warn', '[采集] 采集多边形图元失败，已降级为空数组', {
+			error: error instanceof Error ? error.message : String(error),
+			elapsed: Date.now() - t0,
+			schematicPageUuid: schematicPageUuid || '(当前页)',
+		});
+		return [];
+	}
+}
+
+/**
+ * 采集矩形图元
+ * 失败时降级为空数组，不阻塞主流程
+ */
+async function collectRectangles(
+	options: CollectTextAndBusOptions = {},
+): Promise<RawRectangle[]> {
+	const { schematicPageUuid } = options;
+	const t0 = Date.now();
+
+	try {
+		let failedCount = 0;
+		const rectanglePrimitives = await eda.sch_PrimitiveRectangle.getAll();
+
+		const rectangleTasks = rectanglePrimitives.map(rectanglePrimitive => async () => {
+			try {
+				const [primitiveId, x, y, width, height] = await Promise.all([
+					rectanglePrimitive.getState_PrimitiveId(),
+					rectanglePrimitive.getState_TopLeftX(),
+					rectanglePrimitive.getState_TopLeftY(),
+					rectanglePrimitive.getState_Width(),
+					rectanglePrimitive.getState_Height(),
+				]);
+
+				return {
+					primitiveId,
+					x,
+					y,
+					width,
+					height,
+					schematicPageUuid,
+				} as RawRectangle;
+			}
+			catch {
+				failedCount++;
+				return null;
+			}
+		});
+
+		const results = await promiseAllWithLimit(rectangleTasks, 50);
+		const filtered = results.filter((item): item is RawRectangle => item !== null);
+
+		if (failedCount > 0) {
+			log('warn', '[采集] 矩形图元采集部分失败', {
+				failedCount,
+				total: rectanglePrimitives.length,
+				schematicPageUuid: schematicPageUuid || '(当前页)',
+			});
+		}
+
+		log('info', `[采集] 矩形图元采集完成: 总数=${rectanglePrimitives.length}, 成功=${filtered.length}, 失败=${failedCount}, 耗时=${Date.now() - t0}ms`);
+
+		return filtered;
+	}
+	catch (error) {
+		log('warn', '[采集] 采集矩形图元失败，已降级为空数组', {
+			error: error instanceof Error ? error.message : String(error),
+			elapsed: Date.now() - t0,
+			schematicPageUuid: schematicPageUuid || '(当前页)',
+		});
+		return [];
+	}
+}
+
+/**
+ * 采集独立引脚图元（不隶属于器件的引脚）
+ * 失败时降级为空数组，不阻塞主流程
+ */
+async function collectPrimitivePins(
+	options: CollectTextAndBusOptions = {},
+): Promise<RawPrimitivePin[]> {
+	const { schematicPageUuid } = options;
+	const t0 = Date.now();
+
+	try {
+		let failedCount = 0;
+		const pinPrimitives = await eda.sch_PrimitivePin.getAll();
+
+		const pinTasks = pinPrimitives.map(pinPrimitive => async () => {
+			try {
+				const [primitiveId, pinNumber, pinName, pinType, x, y] = await Promise.all([
+					pinPrimitive.getState_PrimitiveId(),
+					pinPrimitive.getState_PinNumber(),
+					pinPrimitive.getState_PinName(),
+					pinPrimitive.getState_pinType(),
+					pinPrimitive.getState_X(),
+					pinPrimitive.getState_Y(),
+				]);
+
+				return {
+					primitiveId,
+					pinNumber: pinNumber || '',
+					pinName: pinName || '',
+					pinType: pinType !== undefined ? String(pinType) : '',
+					x,
+					y,
+					schematicPageUuid,
+				} as RawPrimitivePin;
+			}
+			catch {
+				failedCount++;
+				return null;
+			}
+		});
+
+		const results = await promiseAllWithLimit(pinTasks, 50);
+		const filtered = results.filter((item): item is RawPrimitivePin => item !== null);
+
+		if (failedCount > 0) {
+			log('warn', '[采集] 独立引脚图元采集部分失败', {
+				failedCount,
+				total: pinPrimitives.length,
+				schematicPageUuid: schematicPageUuid || '(当前页)',
+			});
+		}
+
+		log('info', `[采集] 独立引脚图元采集完成: 总数=${pinPrimitives.length}, 成功=${filtered.length}, 失败=${failedCount}, 耗时=${Date.now() - t0}ms`);
+
+		return filtered;
+	}
+	catch (error) {
+		log('warn', '[采集] 采集独立引脚图元失败，已降级为空数组', {
+			error: error instanceof Error ? error.message : String(error),
+			elapsed: Date.now() - t0,
+			schematicPageUuid: schematicPageUuid || '(当前页)',
+		});
+		return [];
+	}
+}
+
+/**
+ * 三点外接圆计算圆弧几何参数
+ * 通过起点、参考点、终点三个坐标推导圆心、半径和角度
+ */
+function deriveArcGeometry(
+	startX: number,
+	startY: number,
+	referenceX: number,
+	referenceY: number,
+	endX: number,
+	endY: number,
+): { cx: number; cy: number; radius: number; startAngle: number; endAngle: number } | null {
+	const determinant = 2 * (
+		startX * (referenceY - endY)
+		+ referenceX * (endY - startY)
+		+ endX * (startY - referenceY)
+	);
+
+	// 三点共线，无法构成圆弧
+	if (Math.abs(determinant) < 1e-6) {
+		return null;
+	}
+
+	const startSq = startX ** 2 + startY ** 2;
+	const refSq = referenceX ** 2 + referenceY ** 2;
+	const endSq = endX ** 2 + endY ** 2;
+
+	const cx = (
+		startSq * (referenceY - endY)
+		+ refSq * (endY - startY)
+		+ endSq * (startY - referenceY)
+	) / determinant;
+	const cy = (
+		startSq * (endX - referenceX)
+		+ refSq * (startX - endX)
+		+ endSq * (referenceX - startX)
+	) / determinant;
+
+	const radius = Math.sqrt((startX - cx) ** 2 + (startY - cy) ** 2);
+	if (!Number.isFinite(radius) || radius <= 0) {
+		return null;
+	}
+
+	const toDeg = (rad: number) => (rad * 180) / Math.PI;
+	const normalize = (angle: number) => {
+		const mod = angle % 360;
+		return mod < 0 ? mod + 360 : mod;
+	};
+
+	const startAngle = normalize(toDeg(Math.atan2(startY - cy, startX - cx)));
+	const endAngle = normalize(toDeg(Math.atan2(endY - cy, endX - cx)));
+
+	return { cx, cy, radius, startAngle, endAngle };
+}
+
+/**
+ * 解析网表字符串（支持 JLCEDA_PRO 和 Protel2 格式）
+ */
+export function parseNetlist(netlistRaw: string | undefined): Map<string, string> {
+	const map = new Map<string, string>();
+	if (!netlistRaw)
+		return map;
+
+	try {
+		log('debug', '[采集] 开始解析网表', { length: netlistRaw.length });
+
+		// 策略1：JLCEDA_PRO 格式（关键字 "NET:"）
+		if (netlistRaw.includes('NET:')) {
+			parseNetlistJlcedaPro(netlistRaw, map);
+		}
+
+		// 策略2：PROTEL NETLIST 2.0 格式（方括号器件 + 圆括号网络）
+		if (map.size === 0 && netlistRaw.startsWith('PROTEL NETLIST 2.0')) {
+			parseNetlistProtel2V2(netlistRaw, map);
+		}
+
+		// 策略3：Protel2 标准格式（关键字 "Net List" 或 "Component List"）
+		if (map.size === 0 && (netlistRaw.includes('Net List') || netlistRaw.includes('Component List'))) {
+			parseNetlistProtel2Standard(netlistRaw, map);
+		}
+
+		// 策略4：通用 Designator-Pin 格式（使用正则全局匹配）
+		if (map.size === 0) {
+			parseNetlistGeneric(netlistRaw, map);
+		}
+
+		log('info', `[采集] 网表解析完成: ${map.size} 个 pin-net 映射`);
+	}
+	catch (error) {
+		log('warn', `[采集] 网表解析失败: ${error instanceof Error ? error.message : String(error)}`);
+	}
+
+	return map;
+}
+
+/**
+ * 解析 JLCEDA_PRO 格式网表
+ *
+ * 格式：
+ * NET: VCC_3V3
+ *   U1-1
+ *   C1-1
+ */
+function parseNetlistJlcedaPro(netlistRaw: string, map: Map<string, string>): void {
+	const lines = netlistRaw.split('\n');
+	let currentNet = '';
+
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (trimmed.startsWith('NET:')) {
+			currentNet = trimmed.substring(4).trim();
+		}
+		else if (currentNet && trimmed.includes('-')) {
+			const dashIdx = trimmed.indexOf('-');
+			const designator = trimmed.substring(0, dashIdx).trim();
+			const pinNumber = trimmed.substring(dashIdx + 1).trim();
+			if (designator && pinNumber && /^[A-Z]/.test(designator)) {
+				map.set(`${designator}_${pinNumber}`, currentNet);
+			}
+		}
+	}
+}
+
+/**
+ * 解析 PROTEL NETLIST 2.0 格式网表
+ *
+ * 格式特征：
+ * - 第一行: "PROTEL NETLIST 2.0"
+ * - Component 部分: 方括号 [...] 包裹，含 DESIGNATOR/FOOTPRINT/PARTTYPE 等
+ * - Net 部分: 圆括号 (...) 包裹，含网络名和 Designator-Pin 连接
+ *
+ * 示例：
+ * PROTEL NETLIST 2.0
+ * [
+ * DESIGNATOR
+ * U1
+ * FOOTPRINT
+ * LQFP-48
+ * ...
+ * ]
+ * (
+ * GND
+ * U1-14
+ * C1-2
+ * )
+ * (
+ * VCC_3V3
+ * U1-1
+ * C1-1
+ * )
+ */
+function parseNetlistProtel2V2(netlistRaw: string, map: Map<string, string>): void {
+	const lines = netlistRaw.split('\n');
+	let inNetSection = false;
+	let currentNet = '';
+	let justOpenedParen = false;
+
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (!trimmed)
+			continue;
+
+		// 圆括号开始：标志 Net 部分的一个网络块
+		if (trimmed === '(') {
+			inNetSection = true;
+			justOpenedParen = true;
+			currentNet = '';
+			continue;
+		}
+
+		// 圆括号结束：当前网络块结束
+		if (trimmed === ')') {
+			inNetSection = false;
+			currentNet = '';
+			justOpenedParen = false;
+			continue;
+		}
+
+		// 方括号开始/结束：Component 部分（跳过）
+		if (trimmed === '[' || trimmed === ']') {
+			inNetSection = false;
+			justOpenedParen = false;
+			continue;
+		}
+
+		if (inNetSection) {
+			// 圆括号后的第一个非空行是网络名
+			if (justOpenedParen) {
+				currentNet = trimmed;
+				justOpenedParen = false;
+				continue;
+			}
+
+			// 后续行是 Designator-Pin 连接
+			// 格式：U4-18 RTL8723模组-CHIP_EN Input
+			// 需要提取：Designator=U4, PinNumber=18（只取第一个空格前的部分）
+			if (currentNet) {
+				const dashIdx = trimmed.indexOf('-');
+				if (dashIdx > 0) {
+					const designator = trimmed.substring(0, dashIdx);
+					const afterDash = trimmed.substring(dashIdx + 1);
+					// 只取第一个空格之前的部分作为 pinNumber
+					const spaceIdx = afterDash.indexOf(' ');
+					const pinNumber = spaceIdx > 0 ? afterDash.substring(0, spaceIdx) : afterDash;
+					if (designator && pinNumber && /^[A-Z]/.test(designator)) {
+						map.set(`${designator}_${pinNumber}`, currentNet);
+					}
+				}
+			}
+		}
+	}
+
+	if (map.size > 0) {
+		log('debug', `[采集] 使用 PROTEL NETLIST 2.0 格式解析器`);
+	}
+}
+
+/**
+ * 解析 Protel2 标准格式网表
+ *
+ * 结构包含两个部分：
+ * ( { Component List }
+ *   ( U1 LQFP-48 )
+ *   ( C1 C0402 )
+ * )
+ * ( { Net List }
+ *   ( GND
+ *     U1-14
+ *     C1-2
+ *   )
+ *   ( VCC_3V3
+ *     U1-1
+ *     C1-1
+ *   )
+ * )
+ */
+function parseNetlistProtel2Standard(netlistRaw: string, map: Map<string, string>): void {
+	const lines = netlistRaw.split('\n');
+	let inNetListSection = false;
+	let currentNet = '';
+
+	for (const line of lines) {
+		const trimmed = line.trim();
+
+		// 检测 Net List 部分开始
+		if (trimmed.includes('Net List')) {
+			inNetListSection = true;
+			currentNet = '';
+			continue;
+		}
+
+		// 检测 Component List 部分（跳过）
+		if (trimmed.includes('Component List')) {
+			inNetListSection = false;
+			currentNet = '';
+			continue;
+		}
+
+		if (!inNetListSection)
+			continue;
+
+		// 匹配网络名称行：( GND 或 ( VCC_3V3 或 ( NET_LCD_DE
+		// 网络名在 "(" 之后，可能独占一行或者和 "(" 在同一行
+		const netOpenMatch = trimmed.match(/^\(\s*([^\s)]+)\s*$/);
+		if (netOpenMatch && !trimmed.endsWith(')')) {
+			const candidate = netOpenMatch[1];
+			// 排除明显不是网络名的行（如大括号注释）
+			if (candidate && !candidate.startsWith('{') && !candidate.startsWith('(')) {
+				currentNet = candidate;
+				continue;
+			}
+		}
+
+		// 匹配引脚连接行：U1-14 或 R1-2 或 J1-3
+		// Designator 格式：字母+数字，Pin 格式：数字（可能包含字母如 A1）
+		if (currentNet) {
+			const pinMatch = trimmed.match(/^([A-Z][A-Z0-9]*\d)-(\S+)\s*$/);
+			if (pinMatch) {
+				map.set(`${pinMatch[1]}_${pinMatch[2]}`, currentNet);
+				continue;
+			}
+		}
+
+		// 网络结束：单独的 )
+		if (trimmed === ')') {
+			currentNet = '';
+		}
+	}
+
+	if (map.size > 0) {
+		log('debug', `[采集] 使用 Protel2 标准格式解析器`);
+	}
+}
+
+/**
+ * 通用网表解析器（正则全局匹配）
+ *
+ * 在整个网表文本中搜索 Designator-Pin 模式，
+ * 结合上下文推断网络名称。
+ * 支持多种变体格式。
+ */
+function parseNetlistGeneric(netlistRaw: string, map: Map<string, string>): void {
+	const lines = netlistRaw.split('\n');
+	let currentNet = '';
+	let lastOpenParen = '';
+
+	for (const line of lines) {
+		const trimmed = line.trim();
+
+		// 跟踪 "(" 开始的块——可能是网络名
+		const parenMatch = trimmed.match(/^\(\s*([^\s)]+)\s*$/);
+		if (parenMatch) {
+			const content = parenMatch[1];
+			// 如果内容不是大括号注释也不是 Designator-Pin 格式
+			if (!content.startsWith('{') && !content.match(/^[A-Z]\S*-\d/)) {
+				lastOpenParen = content;
+			}
+			continue;
+		}
+
+		// 匹配 Designator-Pin 模式（宽松）
+		const pinMatch = trimmed.match(/^([A-Z][A-Z0-9]*\d)-(\S+)$/);
+		if (pinMatch && lastOpenParen) {
+			currentNet = lastOpenParen;
+			map.set(`${pinMatch[1]}_${pinMatch[2]}`, currentNet);
+			continue;
+		}
+
+		// 单独的 ) 结束当前块
+		if (trimmed === ')') {
+			lastOpenParen = '';
+			currentNet = '';
+		}
+	}
+
+	if (map.size > 0) {
+		log('debug', `[采集] 使用通用格式解析器`);
+	}
+}
+
+/**
+ * 诊断辅助：查找最近导线端点的距离（用于判断容差是否合适）
+ */
+function findNearestWireDistance(
+	pinX: number,
+	pinY: number,
+	validWires: Array<{ net: string; lines: number[][] }>,
+	emptyWires: Array<{ lines: number[][] }>,
+): { distance: number; net: string | null } | null {
+	let nearest: { distance: number; net: string | null } | null = null;
+
+	const allWires: Array<{ net: string | null; lines: number[][] }> = [
+		...validWires.map(w => ({ net: w.net as string | null, lines: w.lines })),
+		...emptyWires.map(w => ({ net: null as string | null, lines: w.lines })),
+	];
+
+	for (const wire of allWires) {
+		for (const line of wire.lines) {
+			for (let i = 0; i < line.length; i += 2) {
+				const wx = line[i];
+				const wy = line[i + 1];
+				if (wx === undefined || wy === undefined)
+					continue;
+
+				const distance = Math.sqrt((pinX - wx) ** 2 + (pinY - wy) ** 2);
+				if (!nearest || distance < nearest.distance) {
+					nearest = { distance, net: wire.net };
+				}
+			}
+		}
+	}
+
+	return nearest;
+}
+
+/**
+ * 诊断辅助：查找最近网络标记的距离
+ */
+function findNearestLabelDistance(
+	pinX: number,
+	pinY: number,
+	netLabels: RawNetLabel[],
+): { distance: number; net: string } | null {
+	let nearest: { distance: number; net: string } | null = null;
+
+	for (const label of netLabels) {
+		if (!label.netName)
+			continue;
+
+		const distance = Math.sqrt((pinX - label.x) ** 2 + (pinY - label.y) ** 2);
+		if (!nearest || distance < nearest.distance) {
+			nearest = { distance, net: label.netName };
+		}
+	}
+
+	return nearest;
+}
+
+/**
+ * 诊断辅助：查找最近导线拓扑点的距离
+ */
+function findNearestTopoDistance(
+	pinX: number,
+	pinY: number,
+	wireClusters: WireCluster[],
+): { distance: number } | null {
+	let nearest: { distance: number } | null = null;
+
+	for (const cluster of wireClusters) {
+		for (const point of cluster.points) {
+			const dist = Math.sqrt((pinX - point.x) ** 2 + (pinY - point.y) ** 2);
+			if (!nearest || dist < nearest.distance) {
+				nearest = { distance: dist };
+			}
+		}
+	}
+
+	return nearest;
+}
+
+/**
+ * 导线拓扑簇（L4 策略的数据结构）
+ */
+interface WireCluster {
+	id: string;
+	netName: string | null;
+	points: Array<{ x: number; y: number }>;
+	confidence: number; // 0.5=推断, 0.6=空导线, 0.7=标记, 0.8=导线net
+}
+
+/**
+ * L4: 构建导线拓扑图
+ * 通过导线的物理连接关系推断网络，即使导线的 net 属性为空
+ */
+function buildWireTopology(
+	validWires: Array<{ net: string; lines: number[][] }>,
+	emptyWires: Array<{ lines: number[][] }>,
+	netLabels: RawNetLabel[],
+): WireCluster[] {
+	const CONNECT_TOLERANCE = 15; // 导线端点连接容差（增大以匹配栅格偏移）
+
+	// 1. 收集所有导线段
+	interface WireSegment {
+		net: string | null;
+		points: Array<{ x: number; y: number }>;
+	}
+
+	const allSegments: WireSegment[] = [];
+
+	// 有 net 的导线
+	for (const wire of validWires) {
+		for (const line of wire.lines) {
+			const points: Array<{ x: number; y: number }> = [];
+			for (let i = 0; i < line.length; i += 2) {
+				if (line[i] !== undefined && line[i + 1] !== undefined) {
+					points.push({ x: line[i], y: line[i + 1] });
+				}
+			}
+			if (points.length >= 2) {
+				allSegments.push({ net: wire.net, points });
+			}
+		}
+	}
+
+	// net 为空的导线
+	for (const wire of emptyWires) {
+		for (const line of wire.lines) {
+			const points: Array<{ x: number; y: number }> = [];
+			for (let i = 0; i < line.length; i += 2) {
+				if (line[i] !== undefined && line[i + 1] !== undefined) {
+					points.push({ x: line[i], y: line[i + 1] });
+				}
+			}
+			if (points.length >= 2) {
+				allSegments.push({ net: null, points });
+			}
+		}
+	}
+
+	if (allSegments.length === 0) {
+		return [];
+	}
+
+	// 2. 使用并查集构建连通分量
+	const parent = new Map<number, number>();
+	const rank = new Map<number, number>();
+
+	function find(x: number): number {
+		if (!parent.has(x)) {
+			parent.set(x, x);
+			rank.set(x, 0);
+		}
+		if (parent.get(x) !== x) {
+			parent.set(x, find(parent.get(x)!));
+		}
+		return parent.get(x)!;
+	}
+
+	function union(x: number, y: number): void {
+		const rootX = find(x);
+		const rootY = find(y);
+		if (rootX === rootY)
+			return;
+
+		const rankX = rank.get(rootX) || 0;
+		const rankY = rank.get(rootY) || 0;
+
+		if (rankX < rankY) {
+			parent.set(rootX, rootY);
+		}
+		else if (rankX > rankY) {
+			parent.set(rootY, rootX);
+		}
+		else {
+			parent.set(rootY, rootX);
+			rank.set(rootX, rankX + 1);
+		}
+	}
+
+	// 3. 连接相邻的导线段
+	for (let i = 0; i < allSegments.length; i++) {
+		for (let j = i + 1; j < allSegments.length; j++) {
+			const seg1 = allSegments[i];
+			const seg2 = allSegments[j];
+
+			// 检查两个线段的端点是否接近
+			for (const p1 of seg1.points) {
+				for (const p2 of seg2.points) {
+					const dist = Math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2);
+					if (dist < CONNECT_TOLERANCE) {
+						union(i, j);
+					}
+				}
+			}
+		}
+	}
+
+	// 4. 按连通分量分组
+	const clusters = new Map<number, number[]>();
+	for (let i = 0; i < allSegments.length; i++) {
+		const root = find(i);
+		if (!clusters.has(root)) {
+			clusters.set(root, []);
+		}
+		clusters.get(root)!.push(i);
+	}
+
+	// 5. 为每个连通分量确定网络名称
+	const wireClusters: WireCluster[] = [];
+	let clusterIndex = 0;
+
+	for (const [_root, segmentIndices] of clusters.entries()) {
+		// 收集该连通分量的所有点
+		const allPoints: Array<{ x: number; y: number }> = [];
+		let netFromWire: string | null = null;
+
+		for (const idx of segmentIndices) {
+			const seg = allSegments[idx];
+			allPoints.push(...seg.points);
+			if (seg.net && !netFromWire) {
+				netFromWire = seg.net;
+			}
+		}
+
+		// 优先使用导线自带的 net
+		let netName = netFromWire;
+		let confidence = netFromWire ? 0.8 : 0.6;
+
+		// 如果导线没有 net，尝试从网络标记推断
+		if (!netName) {
+			const LABEL_TOLERANCE = 100;
+			for (const label of netLabels) {
+				for (const point of allPoints) {
+					const dist = Math.sqrt((point.x - label.x) ** 2 + (point.y - label.y) ** 2);
+					if (dist < LABEL_TOLERANCE) {
+						netName = label.netName;
+						confidence = 0.7;
+						break;
+					}
+				}
+				if (netName)
+					break;
+			}
+		}
+
+		// 如果还是没有，分配临时名称
+		if (!netName) {
+			netName = `WIRE_CLUSTER_${String(clusterIndex + 1).padStart(3, '0')}`;
+			confidence = 0.5;
+		}
+
+		wireClusters.push({
+			id: `cluster_${clusterIndex}`,
+			netName,
+			points: allPoints,
+			confidence,
+		});
+
+		clusterIndex++;
+	}
+
+	log('debug', `[L4拓扑] 构建了 ${wireClusters.length} 个导线簇`);
+
+	return wireClusters;
+}
+
+/**
+ * 构建网络统计
+ */
+function buildNetStatistics(pins: RawPin[]): RawNet[] {
+	const netMap = new Map<string, Set<string>>();
+
+	for (const pin of pins) {
+		if (!pin.netName)
+			continue;
+
+		if (!netMap.has(pin.netName)) {
+			netMap.set(pin.netName, new Set());
+		}
+		netMap.get(pin.netName)!.add(pin.primitiveId);
+	}
+
+	return Array.from(netMap.entries()).map(([netName, pinSet]) => ({
+		netName,
+		pinCount: pinSet.size,
+		pins: Array.from(pinSet),
+	}));
+}

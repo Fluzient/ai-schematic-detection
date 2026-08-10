@@ -1,0 +1,15 @@
+{
+	"About": "About",
+	"EasyEDA extension SDK v": "EasyEDA extension SDK v${1}",
+	"Schematic AI Inspection...": "Schematic AI Inspection...",
+	"Inspection Settings...": "Inspection Settings...",
+	"AI Inspection": "AI Inspection",
+	"Schematic review started": "Schematic review started",
+	"Collecting schematic data...": "Collecting schematic data...",
+	"Running local rule checks...": "Running local rule checks...",
+	"Sending to AI for analysis...": "Sending to AI for analysis...",
+	"Review complete": "Review complete",
+	"Review failed": "Review failed",
+	"No active schematic document": "No active schematic document",
+	"AI API Key not configured": "AI API Key not configured"
+}

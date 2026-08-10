@@ -1,0 +1,16 @@
+/build/
+/config/
+/docs/
+/node_modules/
+/packages/
+/src/
+/.npm-cache/
+/.edaignore
+/eslint.config.mjs
+/package-lock.json
+/package.json
+/tsconfig.json
+*.md
+!README.md
+!CHANGELOG.md
+*.eext
