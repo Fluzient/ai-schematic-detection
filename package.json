@@ -3,6 +3,7 @@
 	"version": "0.1.0",
 	"description": "AI-powered schematic inspection and chat for EasyEDA Pro",
 	"license": "Apache-2.0",
+	"repository": "https://github.com/Fluzient/ai-schematic-detection",
 	"keywords": [
 		"easyeda",
 		"schematic",
