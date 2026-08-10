@@ -78,6 +78,14 @@ function main() {
 		}
 	}
 
+	const logoPath = extensionConfig.images?.logo.replace(/^\.\//, '');
+	if (!logoPath || !fs.existsSync(path.join(__dirname, '../', logoPath))) {
+		throw new Error(`Logo file declared in extension.json does not exist: ${extensionConfig.images?.logo}`);
+	}
+	if (!fileList.includes(logoPath)) {
+		throw new Error(`Logo file is excluded from the extension package: ${logoPath}`);
+	}
+
 	const zip = new JSZip();
 	for (const file of fileList) {
 		// 排除原始的 README.md 和 CHANGELOG.md，使用简化版本

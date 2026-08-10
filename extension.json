@@ -18,7 +18,7 @@
 		"对话"
 	],
 	"images": {
-		"logo": "./images/logo.png"
+		"logo": "./images/logo.jpg"
 	},
 	"activationEvents": {},
 	"entry": "./dist/index",
