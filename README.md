@@ -23,7 +23,7 @@
 
 ## 安装方法
 
-1. 下载扩展文件 `ai-schematic-detection_v0.1.1.eext`。
+1. 下载扩展文件 `ai-schematic-detection_v0.1.0.eext`。
 2. 在嘉立创 EDA 专业版中打开扩展管理器。
 3. 选择导入本地扩展并安装 `.eext` 文件。
 4. 安装完成后打开一个原理图工程。
