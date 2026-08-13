@@ -62,11 +62,11 @@ AI 的输出可能存在遗漏或错误，只适合作为设计辅助。生产�
 ## 例程
 
 1.打开AI助手界面后选择模型与数据选择（如下图），选择自己对应的供应商（也可以选择自定义），只需要复制自己的API即可绑定成功
-![alt text](images/image.png)
+![alt text](images/image0.png)
 2.打开任意一个原理图，即可与AI进行对话（原理图越复杂时间越长）
-![alt text](image.png)
+![alt text](images/image1.png)
 3.点击R1可以跳转到对应的元件，并且读取的阻值都是正确的
-![alt text](image-1.png)
+![alt text](images/image2.png)
 4.主要功能包括
    - `检查整个电路主要功能和是否出现风险`
    - `搜索指定的芯片功能和作用`
